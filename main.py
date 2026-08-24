@@ -25,7 +25,7 @@ from curriculum import (
 # ============================================================
 
 APP_NAME = "MATATAG Grade 1-3 Reading Activity Generator API"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
@@ -639,8 +639,11 @@ async def matatag_metadata() -> MatatagMetadataResponse:
     tags=["matatag"],
 )
 async def get_matatag_competencies(
-    grade: Literal[1, 2, 3] | None = Query(default=None),
-    quarter: Literal[1, 2, 3, 4] | None = Query(default=None),
+    # Query-string values arrive as text (for example ?grade=2&quarter=1).
+    # Use constrained ints here so FastAPI/Pydantic can coerce "2" -> 2
+    # instead of rejecting it as a Literal mismatch.
+    grade: int | None = Query(default=None, ge=1, le=3),
+    quarter: int | None = Query(default=None, ge=1, le=4),
     subdomain: str | None = Query(default=None, max_length=120),
 ) -> list[CompetencyResponse]:
     values = list_competencies(
