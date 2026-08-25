@@ -4,11 +4,13 @@ import asyncio
 import hmac
 import logging
 import os
+from importlib.metadata import PackageNotFoundError, version
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -25,7 +27,7 @@ from curriculum import (
 # ============================================================
 
 APP_NAME = "MATATAG Grade 1-3 Reading Activity Generator API"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
@@ -456,6 +458,47 @@ def validate_generated_activity(
     return errors
 
 
+
+class GeminiDiagnosticResponse(BaseModel):
+    ok: bool
+    model: str
+    sdk_version: str
+    api_key_configured: bool
+    api_key_prefix: str | None = None
+    gemini_code: int | None = None
+    gemini_status: str | None = None
+    gemini_message: str | None = None
+    response_text: str | None = None
+
+
+def get_google_genai_version() -> str:
+    try:
+        return version("google-genai")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def safe_gemini_error(exc: Exception) -> tuple[int | None, str | None, str]:
+    """Extract useful Gemini error information without exposing credentials."""
+    if isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+        api_status = getattr(exc, "status", None)
+        message = getattr(exc, "message", None) or "Gemini API request failed."
+        return code, api_status, str(message)
+
+    return None, None, f"{type(exc).__name__}: {str(exc)}"
+
+
+def gemini_http_detail(exc: Exception) -> str:
+    code, api_status, message = safe_gemini_error(exc)
+
+    if code is not None:
+        status_text = f" {api_status}" if api_status else ""
+        return f"Gemini API error {code}{status_text}: {message}"
+
+    return f"Gemini generation failed: {message}"
+
+
 # ============================================================
 # GEMINI GENERATION
 # ============================================================
@@ -513,9 +556,10 @@ async def generate_with_gemini(
                 )
                 continue
 
-            detail = f"Gemini generation failed: {type(exc).__name__}"
-            if DEBUG_GEMINI_ERRORS:
-                detail += f": {str(exc)}"
+            # APIError exposes the actual HTTP code/status/message from Gemini.
+            # These fields are safe to show to the developer and do not include
+            # the API key. This makes 400 vs 401 vs 403 vs 429 immediately clear.
+            detail = gemini_http_detail(exc)
 
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -668,6 +712,75 @@ async def get_matatag_competency(competency_code: str) -> CompetencyResponse:
         )
 
     return competency_to_response(competency)
+
+
+
+# ============================================================
+# GEMINI DIAGNOSTIC
+# ============================================================
+
+@app.get(
+    "/gemini/diagnostic",
+    response_model=GeminiDiagnosticResponse,
+    tags=["system"],
+    dependencies=[Depends(require_internal_key)],
+)
+async def gemini_diagnostic() -> GeminiDiagnosticResponse:
+    """
+    Test only Gemini authentication/model access.
+
+    This deliberately does NOT use MATATAG, structured output, or the activity
+    schema, so failures here point to the API key/model/quota rather than our
+    curriculum-generation logic.
+    """
+    prefix = None
+    if GEMINI_API_KEY:
+        prefix = GEMINI_API_KEY[:5] + "…" if len(GEMINI_API_KEY) > 5 else "configured"
+
+    base = {
+        "model": GEMINI_MODEL,
+        "sdk_version": get_google_genai_version(),
+        "api_key_configured": bool(GEMINI_API_KEY),
+        "api_key_prefix": prefix,
+    }
+
+    if not GEMINI_API_KEY:
+        return GeminiDiagnosticResponse(
+            ok=False,
+            **base,
+            gemini_message="GEMINI_API_KEY is not configured.",
+        )
+
+    client = get_gemini_client()
+
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents="Reply with exactly: OK",
+            config=types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=16,
+            ),
+        )
+
+        return GeminiDiagnosticResponse(
+            ok=True,
+            **base,
+            response_text=(response.text or "").strip(),
+        )
+
+    except Exception as exc:
+        logger.exception("Gemini diagnostic failed using model %s", GEMINI_MODEL)
+        code, api_status, message = safe_gemini_error(exc)
+
+        return GeminiDiagnosticResponse(
+            ok=False,
+            **base,
+            gemini_code=code,
+            gemini_status=api_status,
+            gemini_message=message,
+        )
 
 
 # ============================================================
