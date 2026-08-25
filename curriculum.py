@@ -206,3 +206,130 @@ def list_competencies(
         needle = subdomain.strip().casefold()
         values = [item for item in values if needle in item.subdomain.casefold()]
     return values
+
+# ---------------------------------------------------------------------------
+# APP-FACING GROUPED COMPETENCIES
+# ---------------------------------------------------------------------------
+# Teachers do not select a quarter or individual MATATAG code in v3.
+# The application exposes three broad reading competencies per grade and keeps
+# the official MATATAG records underneath each group for alignment/auditing.
+
+
+@dataclass(frozen=True)
+class GroupedReadingCompetency:
+    key: str
+    label: str
+    description: str
+    allowed_activity_types: tuple[str, ...]
+
+
+GROUPED_READING_COMPETENCIES: tuple[GroupedReadingCompetency, ...] = (
+    GroupedReadingCompetency(
+        key="foundational_reading",
+        label="Foundational Reading",
+        description=(
+            "Builds phonological awareness, phonics and word study, sight/high-frequency "
+            "word recognition, vocabulary/word knowledge, and accurate decoding."
+        ),
+        allowed_activity_types=(
+            "word_reading",
+            "sight_word_reading",
+            "phonics_reading",
+        ),
+    ),
+    GroupedReadingCompetency(
+        key="reading_fluency",
+        label="Reading Fluency",
+        description=(
+            "Builds accurate, increasingly automatic and expressive oral reading of "
+            "sentences and connected text."
+        ),
+        allowed_activity_types=(
+            "sentence_reading",
+            "passage_reading",
+            "timed_reading",
+            "repeated_reading",
+        ),
+    ),
+    GroupedReadingCompetency(
+        key="reading_comprehension",
+        label="Reading Comprehension",
+        description=(
+            "Builds understanding of age-appropriate narrative and informational text, "
+            "including important details, sequence, relationships, inference, and conclusions."
+        ),
+        allowed_activity_types=(
+            "passage_reading",
+            "reading_comprehension",
+        ),
+    ),
+)
+
+GROUPED_COMPETENCY_BY_KEY = {
+    item.key: item for item in GROUPED_READING_COMPETENCIES
+}
+
+
+def get_grouped_competency(key: str) -> GroupedReadingCompetency | None:
+    return GROUPED_COMPETENCY_BY_KEY.get(key.strip().lower())
+
+
+def grouped_competencies_for_grade(grade: int) -> list[GroupedReadingCompetency]:
+    # All three groups are exposed for Grades 1-3. Their underlying MATATAG
+    # records differ by grade and are resolved by records_for_group().
+    if grade not in {1, 2, 3}:
+        return []
+    return list(GROUPED_READING_COMPETENCIES)
+
+
+def _is_fluency_record(item: MatatagCompetency) -> bool:
+    if item.subdomain != "Comprehending and Analyzing Text":
+        return False
+    text = item.competency.casefold()
+    fluency_markers = (
+        "speed, accuracy, and expression",
+        "speed, accuracy and expression",
+        "appropriate speed",
+        "read grade-level sentences",
+        "read sentences with appropriate",
+    )
+    return any(marker in text for marker in fluency_markers)
+
+
+def group_key_for_record(item: MatatagCompetency) -> str:
+    if item.subdomain == "Comprehending and Analyzing Text":
+        if _is_fluency_record(item):
+            return "reading_fluency"
+        return "reading_comprehension"
+    return "foundational_reading"
+
+
+def records_for_group(
+    *,
+    grade: int,
+    group_key: str,
+) -> list[MatatagCompetency]:
+    key = group_key.strip().lower()
+    if key not in GROUPED_COMPETENCY_BY_KEY:
+        return []
+    return [
+        item
+        for item in MATATAG_COMPETENCIES
+        if item.grade == grade and group_key_for_record(item) == key
+    ]
+
+
+def unique_alignment_statements(
+    *,
+    grade: int,
+    group_key: str,
+) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in records_for_group(grade=grade, group_key=group_key):
+        normalized = item.competency.strip().casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(item.competency.strip())
+    return result
