@@ -27,7 +27,7 @@ from curriculum import (
 # ============================================================
 
 APP_NAME = "MATATAG Grade 1-3 Reading Activity Generator API"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
@@ -499,6 +499,84 @@ def gemini_http_detail(exc: Exception) -> str:
     return f"Gemini generation failed: {message}"
 
 
+def build_gemini_response_json_schema(number_of_items: int) -> dict:
+    """Build a small native JSON Schema for Gemini structured output.
+
+    Use response_json_schema rather than response_schema so the SDK sends
+    native JSON Schema instead of converting our nested Pydantic models to
+    Google's legacy Schema representation.
+
+    Pydantic still performs strict validation after Gemini responds.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Short learner-friendly activity title.",
+            },
+            "instructions": {
+                "type": "string",
+                "description": "Brief student-facing instructions.",
+            },
+            "passage": {
+                "type": ["string", "null"],
+                "description": (
+                    "Short age-appropriate reading passage when the activity "
+                    "needs one; otherwise null."
+                ),
+            },
+            "items": {
+                "type": "array",
+                "minItems": number_of_items,
+                "maxItems": number_of_items,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "number": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": number_of_items,
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The learner-facing question or task.",
+                        },
+                        "choices": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 8,
+                            "description": (
+                                "Answer choices when the activity uses choices; "
+                                "otherwise an empty array."
+                            ),
+                        },
+                        "answer": {
+                            "type": "string",
+                            "description": "The single correct answer.",
+                        },
+                        "explanation": {
+                            "type": "string",
+                            "description": (
+                                "A short factual teacher-facing explanation of "
+                                "why the answer is correct."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "number",
+                        "prompt",
+                        "choices",
+                        "answer",
+                        "explanation",
+                    ],
+                },
+            },
+        },
+        "required": ["title", "instructions", "passage", "items"],
+    }
+
+
 # ============================================================
 # GEMINI GENERATION
 # ============================================================
@@ -531,7 +609,9 @@ async def generate_with_gemini(
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=GeneratedActivity,
+                    response_json_schema=build_gemini_response_json_schema(
+                        request.number_of_items
+                    ),
                     temperature=0.35,
                     max_output_tokens=8192,
                 ),
@@ -549,6 +629,15 @@ async def generate_with_gemini(
                 GEMINI_MODEL,
             )
 
+            # A Gemini API 4xx is a request/auth/quota/schema problem. Repeating
+            # the identical request will not repair it, so surface it immediately.
+            if isinstance(exc, genai_errors.APIError):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=gemini_http_detail(exc),
+                ) from exc
+
+            # Parsing/validation failures may be repairable once.
             if attempt == 0:
                 validation_feedback = (
                     "- Return valid JSON matching the provided structured-output schema.\n"
@@ -556,14 +645,9 @@ async def generate_with_gemini(
                 )
                 continue
 
-            # APIError exposes the actual HTTP code/status/message from Gemini.
-            # These fields are safe to show to the developer and do not include
-            # the API key. This makes 400 vs 401 vs 403 vs 429 immediately clear.
-            detail = gemini_http_detail(exc)
-
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=detail,
+                detail=gemini_http_detail(exc),
             ) from exc
 
         errors = validate_generated_activity(generated, request)
