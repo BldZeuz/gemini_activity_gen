@@ -34,7 +34,7 @@ from curriculum import (
 # ============================================================
 
 APP_NAME = "MATATAG Adaptive Reading Bundle Generator API"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
@@ -54,7 +54,8 @@ ALLOWED_ORIGINS = [
 
 MAX_VARIANTS_PER_LEVEL = 5
 MAX_FOLLOW_UP_QUESTIONS = 4
-MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "32768"))
+LEVEL_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_LEVEL_MAX_OUTPUT_TOKENS", "16384"))
+MAX_GENERATION_ATTEMPTS = int(os.getenv("GEMINI_GENERATION_ATTEMPTS", "3"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -208,6 +209,13 @@ class GeneratedVariant(BaseModel):
         default_factory=list,
         max_length=MAX_FOLLOW_UP_QUESTIONS,
     )
+
+
+class GeneratedLevel(BaseModel):
+    """One difficulty level returned by Gemini."""
+
+    model_config = ConfigDict(extra="forbid")
+    variants: list[GeneratedVariant]
 
 
 class GeneratedLevels(BaseModel):
@@ -528,36 +536,20 @@ def length_band_prompt(request: BundleRequest) -> str:
 # ============================================================
 
 
-def build_prompt(
-    request: BundleRequest,
-    group: GroupedReadingCompetency,
-) -> str:
-    alignment_statements = unique_alignment_statements(
-        grade=request.grade,
-        group_key=group.key,
-    )
-    alignment_text = "\n".join(f"- {statement}" for statement in alignment_statements)
+ACTIVITY_TYPE_LABELS: dict[str, str] = {
+    "word_reading": "Word Reading",
+    "sight_word_reading": "Sight Word Reading",
+    "phonics_reading": "Phonics Reading",
+    "sentence_reading": "Sentence Reading",
+    "passage_reading": "Passage Reading",
+    "timed_reading": "Timed Reading",
+    "repeated_reading": "Repeated Reading",
+    "reading_comprehension": "Reading + Comprehension",
+}
 
-    topic_line = request.topic or "No optional theme; choose safe child-friendly contexts."
-    notes_line = request.teacher_notes or "No additional teacher notes."
 
-    grade_1_rule = ""
-    if request.grade == 1:
-        grade_1_rule = f"""
-GRADE 1 LANGUAGE NOTE
-- {G1_NOTE}
-- Generate English reading practice as an application adaptation while preserving
-  the foundational literacy intent of the underlying MATATAG records.
-""".strip()
-
-    comprehension_rule = (
-        "Each variant MUST include 2-3 short follow-up comprehension questions with "
-        "2-4 choices each. Every answer must be directly supported by display_text."
-        if request.activity_type == "reading_comprehension"
-        else "follow_up_questions MUST be an empty array for every variant."
-    )
-
-    activity_rules = {
+def activity_type_rule(activity_type: str) -> str:
+    return {
         "word_reading": (
             "Generate a space/newline-separated list of real grade-appropriate words. "
             "Do not use sentences. Target accurate oral word reading."
@@ -579,7 +571,7 @@ GRADE 1 LANGUAGE NOTE
         ),
         "timed_reading": (
             "Generate one coherent passage suitable for a timed oral-reading attempt. "
-            "Do not mention a target WPM; the assessment engine measures performance."
+            "Do not state a target WPM; the assessment engine measures performance."
         ),
         "repeated_reading": (
             "Generate one coherent passage suitable for intentionally reading the same "
@@ -589,171 +581,190 @@ GRADE 1 LANGUAGE NOTE
             "Generate one coherent passage that the learner reads aloud first, followed "
             "by comprehension questions answered after reading."
         ),
-    }
+    }[activity_type]
 
-    return f"""
-You generate adaptive oral-reading activity BUNDLES for Grade 1-3 learners in a
-Philippine reading intervention application.
+
+def level_json_shape(request: BundleRequest) -> str:
+    comprehension_note = (
+        "For reading_comprehension, follow_up_questions must contain 2-3 objects. "
+        "For every other activity type it must be []."
+    )
+    return f"""{{
+  \"variants\": [
+    {{
+      \"title\": \"short activity title\",
+      \"instructions\": \"short learner-facing instruction\",
+      \"display_text\": \"ONLY the exact text the child reads aloud\",
+      \"target_skills\": [\"skill 1\"],
+      \"reading_features\": [\"feature 1\"],
+      \"follow_up_questions\": [
+        {{
+          \"question\": \"question text\",
+          \"choices\": [\"choice 1\", \"choice 2\"],
+          \"answer\": \"must exactly equal one choice\",
+          \"explanation\": \"brief teacher-facing explanation\"
+        }}
+      ]
+    }}
+  ]
+}}
+
+The variants array must contain exactly {request.variants_per_level} objects.
+{comprehension_note}"""
+
+
+def build_level_prompt(
+    request: BundleRequest,
+    group: GroupedReadingCompetency,
+    difficulty: Difficulty,
+    *,
+    avoid_texts: list[str],
+    validation_feedback: list[str] | None = None,
+    minimum_average_words: float | None = None,
+) -> str:
+    alignment_statements = unique_alignment_statements(
+        grade=request.grade,
+        group_key=group.key,
+    )
+    alignment_text = "\n".join(f"- {statement}" for statement in alignment_statements)
+
+    topic_line = request.topic or "No optional theme; choose safe child-friendly contexts."
+    notes_line = request.teacher_notes or "No additional teacher notes."
+    low, high = get_length_band(
+        grade=request.grade,
+        activity_type=request.activity_type,
+        difficulty=difficulty,
+    )
+
+    grade_1_rule = ""
+    if request.grade == 1:
+        grade_1_rule = f"""GRADE 1 LANGUAGE NOTE
+- {G1_NOTE}
+- Generate English reading practice as an application adaptation while preserving
+  the foundational literacy intent of the underlying MATATAG records."""
+
+    comprehension_rule = (
+        "Each variant MUST include 2-3 short comprehension questions with 2-4 "
+        "choices each. The answer must exactly equal one choice and be supported "
+        "by display_text."
+        if request.activity_type == "reading_comprehension"
+        else "follow_up_questions MUST be [] for every variant."
+    )
+
+    avoid_rule = "No earlier-level texts need to be avoided."
+    if avoid_texts:
+        compact = "\n".join(f"- {value}" for value in avoid_texts[-10:])
+        avoid_rule = (
+            "Do NOT duplicate or closely paraphrase these already accepted reading texts:\n"
+            + compact
+        )
+
+    progression_rule = ""
+    if minimum_average_words is not None:
+        progression_rule = (
+            f"The previous easier level averaged about {minimum_average_words:.1f} spoken "
+            "words. This level should not be shorter on average."
+        )
+
+    repair = ""
+    if validation_feedback:
+        repair = (
+            "\nREPAIR FEEDBACK FROM THE SERVER\n"
+            "The previous attempt for THIS LEVEL failed. Fix every issue below:\n"
+            + "\n".join(f"- {item}" for item in validation_feedback)
+        )
+
+    return f"""You generate ONE difficulty level of an adaptive oral-reading bundle for
+Grade 1-3 learners in a Philippine reading intervention application.
 
 TEACHER REQUEST
 - Grade: {request.grade}
 - Grouped competency: {group.label} ({group.key})
 - Activity type: {request.activity_type}
-- Variants required PER difficulty level: {request.variants_per_level}
+- Difficulty to generate NOW: {difficulty.upper()}
+- Variants required: {request.variants_per_level}
 - Optional topic/theme: {topic_line}
 - Teacher notes: {notes_line}
 
 INTERNAL MATATAG ALIGNMENT
-The grouped competency is an application-facing grouping. Keep every generated
-reading activity within the following Grade {request.grade} MATATAG reading intents:
+Keep every activity within these Grade {request.grade} MATATAG reading intents:
 {alignment_text}
 
 {grade_1_rule}
 
-BUNDLE REQUIREMENT
-Generate exactly THREE difficulty levels: easy, medium, hard.
-Each level must contain exactly {request.variants_per_level} DIFFERENT variants.
-Total activities = {request.variants_per_level * 3}.
-
 DIFFICULTY POLICY
-The competency stays the SAME across easy, medium, and hard. Difficulty changes
-only through controlled text length, familiarity, decoding load, vocabulary,
-sentence complexity, and independence. Never turn a harder level into a different
-skill or above-grade curriculum objective.
-
-Length guidance (application difficulty bands; not official MATATAG thresholds):
-{length_band_prompt(request)}
+- Generate ONLY the {difficulty.upper()} level in this response.
+- Target approximately {low}-{high} spoken words per variant.
+- {DIFFICULTY_GUIDANCE[difficulty]}
+- The competency never changes between Easy, Medium, and Hard.
+- Difficulty may increase through decoding load, vocabulary, sentence complexity,
+  text length, and independence, but must remain grade-appropriate.
+- {progression_rule or 'Follow the target range and difficulty guidance above.'}
 
 VARIANT POLICY
-- Variants within one level must be equivalent in difficulty but use different text.
-- Do not duplicate a passage, sentence, or word list anywhere in the bundle.
-- Avoid near-duplicates that merely swap a name or one noun.
-- Make every variant independently usable by the recommender.
+- Produce exactly {request.variants_per_level} independently usable variants.
+- Variants must differ meaningfully in text, not merely swap a name or one noun.
+- Do not duplicate another variant in this level.
+- {avoid_rule}
 
 ACTIVITY-TYPE RULE
-{activity_rules[request.activity_type]}
+{activity_type_rule(request.activity_type)}
 
 SPEECH-RECOGNITION COMPATIBILITY
-- display_text must contain ONLY the words/sentences/passage the child is expected
-  to read aloud. Do not include headings, labels, numbering, answer choices, or
-  instructions inside display_text.
-- The server will derive reference_text automatically from display_text.
+- display_text contains ONLY what the child must read aloud.
+- No headings, numbering, answer choices, labels, instructions, emoji, IPA,
+  slash-separated phonemes, or bracket annotations inside display_text.
 - Use ordinary English spelling and punctuation.
-- Do not use emoji, IPA, slash-separated phonemes, bracket annotations, or symbols
-  that a speech recognizer should not be expected to transcribe.
+- The server derives reference_text from display_text; do not output reference_text.
 
 COMPREHENSION RULE
 {comprehension_rule}
 
-METADATA RULES
-- target_skills: 1-4 concise reading skills actually practiced by this variant.
-- reading_features: 1-6 concise observable text features, e.g. "CVC words",
-  "short sentences", "high-frequency words", "two-sentence passage".
-- Do not invent MATATAG codes or quarters in generated JSON. The server owns the
-  trusted curriculum alignment metadata.
+METADATA
+- target_skills: 1-4 concise, non-duplicate reading skills actually practiced.
+- reading_features: 1-6 concise, non-duplicate observable text features.
+- Do not output MATATAG codes, quarters, difficulty, variant labels, word_count,
+  or reference_text. The server owns those fields.
 
-SAFETY / AGE APPROPRIATENESS
+SAFETY
 Use child-safe, culturally neutral or Philippine-friendly everyday contexts.
 Avoid personally identifying information, brands, politics, stereotypes, sexual
 content, graphic violence, frightening mature themes, and trick questions.
 
-OUTPUT
-Return only JSON matching the supplied structured-output schema.
-""".strip()
+JSON OUTPUT
+Return a valid JSON object only. No Markdown fences and no prose before or after it.
+Use exactly this shape:
+{level_json_shape(request)}
+{repair}""".strip()
 
 
 # ============================================================
-# GEMINI JSON SCHEMA
+# JSON RESPONSE PARSING
 # ============================================================
 
 
-def follow_up_question_schema() -> dict:
-    return {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string"},
-            "choices": {
-                "type": "array",
-                "minItems": 2,
-                "maxItems": 4,
-                "items": {"type": "string"},
-            },
-            "answer": {"type": "string"},
-            "explanation": {"type": "string"},
-        },
-        "required": ["question", "choices", "answer", "explanation"],
-    }
+def extract_json_object(text: str) -> str:
+    """Extract a JSON object from normal JSON or a Markdown-wrapped fallback."""
+    value = text.strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s*```$", "", value)
+        value = value.strip()
+
+    first = value.find("{")
+    last = value.rfind("}")
+    if first < 0 or last < first:
+        raise ValueError("Gemini response did not contain a JSON object.")
+    return value[first : last + 1]
 
 
-def variant_schema() -> dict:
-    return {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string"},
-            "instructions": {"type": "string"},
-            "display_text": {"type": "string"},
-            "target_skills": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 6,
-                "items": {"type": "string"},
-            },
-            "reading_features": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 8,
-                "items": {"type": "string"},
-            },
-            "follow_up_questions": {
-                "type": "array",
-                "maxItems": MAX_FOLLOW_UP_QUESTIONS,
-                "items": follow_up_question_schema(),
-            },
-        },
-        "required": [
-            "title",
-            "instructions",
-            "display_text",
-            "target_skills",
-            "reading_features",
-            "follow_up_questions",
-        ],
-    }
-
-
-def build_bundle_json_schema(variants_per_level: int) -> dict:
-    level_schema = {
-        "type": "array",
-        "minItems": variants_per_level,
-        "maxItems": variants_per_level,
-        "items": variant_schema(),
-    }
-
-    return {
-        "type": "object",
-        "properties": {
-            "bundle_title": {"type": "string"},
-            "levels": {
-                "type": "object",
-                "properties": {
-                    "easy": level_schema,
-                    "medium": level_schema,
-                    "hard": level_schema,
-                },
-                "required": ["easy", "medium", "hard"],
-            },
-        },
-        "required": ["bundle_title", "levels"],
-    }
+def parse_generated_level(text: str) -> GeneratedLevel:
+    return GeneratedLevel.model_validate_json(extract_json_object(text))
 
 
 # ============================================================
 # SEMANTIC VALIDATION
 # ============================================================
-
-
-def level_variants(bundle: GeneratedBundle, difficulty: Difficulty) -> list[GeneratedVariant]:
-    return getattr(bundle.levels, difficulty)
 
 
 def validate_follow_up_question(question: FollowUpQuestion, label: str) -> list[str]:
@@ -766,94 +777,107 @@ def validate_follow_up_question(question: FollowUpQuestion, label: str) -> list[
     return errors
 
 
-def validate_generated_bundle(
-    bundle: GeneratedBundle,
+def validate_generated_level(
+    generated: GeneratedLevel,
     request: BundleRequest,
-) -> list[str]:
+    difficulty: Difficulty,
+    *,
+    used_texts: dict[str, str],
+    minimum_average_words: float | None = None,
+) -> tuple[list[str], float | None]:
+    """Validate one difficulty level without making word count the only signal."""
     errors: list[str] = []
-    all_texts: dict[str, str] = {}
-    average_lengths: dict[str, float] = {}
+    variants = generated.variants
 
-    for difficulty in DIFFICULTIES:
-        variants = level_variants(bundle, difficulty)
+    if len(variants) != request.variants_per_level:
+        errors.append(
+            f"{difficulty} must contain exactly {request.variants_per_level} variants; "
+            f"got {len(variants)}."
+        )
+        return errors, None
 
-        if len(variants) != request.variants_per_level:
-            errors.append(
-                f"{difficulty} must contain exactly {request.variants_per_level} variants; "
-                f"got {len(variants)}."
-            )
+    target_low, target_high = get_length_band(
+        grade=request.grade,
+        activity_type=request.activity_type,
+        difficulty=difficulty,
+    )
+
+    accepted_low = max(1, int(target_low * 0.65))
+    accepted_high = max(target_high, int(target_high * 1.40))
+    counts: list[int] = []
+    local_texts: dict[str, str] = {}
+
+    for index, variant in enumerate(variants, start=1):
+        label = f"{difficulty} variant {variant_label(index)}"
+        normalized = comparable_text(variant.display_text)
+
+        if not normalized:
+            errors.append(f"{label} has no readable words.")
             continue
 
-        counts: list[int] = []
-        target_low, target_high = get_length_band(
-            grade=request.grade,
-            activity_type=request.activity_type,
-            difficulty=difficulty,
-        )
-        # Give Gemini modest tolerance while preventing wildly wrong lengths.
-        accepted_low = max(1, int(target_low * 0.80))
-        accepted_high = max(target_high, int(target_high * 1.20))
+        if normalized in used_texts:
+            errors.append(f"{label} duplicates reading text from {used_texts[normalized]}.")
+        if normalized in local_texts:
+            errors.append(f"{label} duplicates reading text from {local_texts[normalized]}.")
+        local_texts[normalized] = label
 
-        for index, variant in enumerate(variants, start=1):
-            label = f"{difficulty} variant {variant_label(index)}"
-            normalized = comparable_text(variant.display_text)
-            if not normalized:
-                errors.append(f"{label} has no readable words.")
-                continue
-
-            if normalized in all_texts:
-                errors.append(
-                    f"{label} duplicates reading text from {all_texts[normalized]}."
-                )
-            else:
-                all_texts[normalized] = label
-
-            count = word_count(variant.display_text)
-            counts.append(count)
-            if count < accepted_low or count > accepted_high:
-                errors.append(
-                    f"{label} has {count} words; expected roughly {target_low}-{target_high} "
-                    f"for this grade/activity/difficulty."
-                )
-
-            # Prevent metadata repetition/noise.
-            skills = [value.strip().casefold() for value in variant.target_skills]
-            if len(skills) != len(set(skills)):
-                errors.append(f"{label} contains duplicate target_skills.")
-
-            features = [value.strip().casefold() for value in variant.reading_features]
-            if len(features) != len(set(features)):
-                errors.append(f"{label} contains duplicate reading_features.")
-
-            if request.activity_type == "reading_comprehension":
-                if not (2 <= len(variant.follow_up_questions) <= 3):
-                    errors.append(
-                        f"{label} must have 2-3 comprehension questions."
-                    )
-                for q_index, question in enumerate(variant.follow_up_questions, start=1):
-                    errors.extend(
-                        validate_follow_up_question(question, f"{label} question {q_index}")
-                    )
-            elif variant.follow_up_questions:
-                errors.append(
-                    f"{label} must have no follow_up_questions for {request.activity_type}."
-                )
-
-        if counts:
-            average_lengths[difficulty] = sum(counts) / len(counts)
-
-    # The level averages should become progressively longer. Length is not the
-    # only difficulty factor, but this catches obvious inversions.
-    if all(key in average_lengths for key in DIFFICULTIES):
-        if not (
-            average_lengths["easy"] < average_lengths["medium"]
-            < average_lengths["hard"]
-        ):
+        count = word_count(variant.display_text)
+        counts.append(count)
+        if count < accepted_low or count > accepted_high:
             errors.append(
-                "Average spoken word count must progress Easy < Medium < Hard."
+                f"{label} has {count} words; target is {target_low}-{target_high} "
+                f"and accepted safety range is {accepted_low}-{accepted_high}."
             )
 
-    return errors
+        skills = [value.strip().casefold() for value in variant.target_skills if value.strip()]
+        if not skills:
+            errors.append(f"{label} must contain at least one target skill.")
+        elif len(skills) != len(set(skills)):
+            errors.append(f"{label} contains duplicate target_skills.")
+
+        features = [value.strip().casefold() for value in variant.reading_features if value.strip()]
+        if not features:
+            errors.append(f"{label} must contain at least one reading feature.")
+        elif len(features) != len(set(features)):
+            errors.append(f"{label} contains duplicate reading_features.")
+
+        if request.activity_type == "reading_comprehension":
+            if not (2 <= len(variant.follow_up_questions) <= 3):
+                errors.append(f"{label} must have 2-3 comprehension questions.")
+            for q_index, question in enumerate(variant.follow_up_questions, start=1):
+                errors.extend(
+                    validate_follow_up_question(question, f"{label} question {q_index}")
+                )
+        elif variant.follow_up_questions:
+            errors.append(
+                f"{label} must have no follow_up_questions for {request.activity_type}."
+            )
+
+    average = (sum(counts) / len(counts)) if counts else None
+
+    # v3.0 required strict Easy < Medium < Hard. v3.1 permits equality and only
+    # repairs a harder level when it is actually shorter on average.
+    if average is not None and minimum_average_words is not None:
+        if average + 0.01 < minimum_average_words:
+            errors.append(
+                f"{difficulty} averages {average:.1f} words, which is shorter than "
+                f"the previous easier level average of {minimum_average_words:.1f}. "
+                "Difficulty progression must be non-decreasing in average length."
+            )
+
+    return errors, average
+
+
+def accepted_text_map(
+    difficulty: Difficulty,
+    variants: list[GeneratedVariant],
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for index, variant in enumerate(variants, start=1):
+        normalized = comparable_text(variant.display_text)
+        if normalized:
+            values[normalized] = f"{difficulty} variant {variant_label(index)}"
+    return values
 
 
 # ============================================================
@@ -884,6 +908,14 @@ def build_variant_response(
     )
 
 
+def server_bundle_title(request: BundleRequest, group: GroupedReadingCompetency) -> str:
+    activity_label = ACTIVITY_TYPE_LABELS.get(
+        request.activity_type,
+        request.activity_type.replace("_", " ").title(),
+    )
+    return f"Grade {request.grade} {group.label} — {activity_label}"
+
+
 def build_response(
     *,
     request: BundleRequest,
@@ -899,7 +931,7 @@ def build_response(
                 generated=variant,
             )
             for index, variant in enumerate(
-                level_variants(generated, difficulty),
+                getattr(generated.levels, difficulty),
                 start=1,
             )
         ]
@@ -932,83 +964,181 @@ def build_response(
 # ============================================================
 
 
-async def generate_bundle_with_gemini(
+def is_invalid_argument_error(exc: Exception) -> bool:
+    if not isinstance(exc, genai_errors.APIError):
+        return False
+    code = getattr(exc, "code", None)
+    api_status = str(getattr(exc, "status", "") or "").upper()
+    message = str(getattr(exc, "message", "") or "").upper()
+    return code == 400 and (
+        api_status == "INVALID_ARGUMENT" or "INVALID ARGUMENT" in message
+    )
+
+
+async def request_level_json(
+    client: genai.Client,
+    prompt: str,
+) -> str:
+    """Call Gemini without the large response schema that caused v3.0 400s."""
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=LEVEL_MAX_OUTPUT_TOKENS,
+            ),
+        )
+    except Exception as exc:
+        if not is_invalid_argument_error(exc):
+            raise
+
+        # Defensive fallback for provider/model configuration changes.
+        logger.warning(
+            "Gemini returned INVALID_ARGUMENT in JSON MIME mode; retrying with "
+            "minimal generation config for model %s.",
+            GEMINI_MODEL,
+        )
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=LEVEL_MAX_OUTPUT_TOKENS,
+            ),
+        )
+
+    if not response.text or not response.text.strip():
+        raise ValueError("Gemini returned an empty response.")
+    return response.text
+
+
+async def generate_one_level(
+    *,
+    client: genai.Client,
     request: BundleRequest,
     group: GroupedReadingCompetency,
-) -> ActivityBundleResponse:
-    client = get_gemini_client()
-    base_prompt = build_prompt(request, group)
-    validation_feedback = ""
+    difficulty: Difficulty,
+    used_texts: dict[str, str],
+    minimum_average_words: float | None,
+) -> tuple[list[GeneratedVariant], float]:
+    validation_feedback: list[str] = []
+    last_errors: list[str] = []
 
-    for attempt in range(2):
-        prompt = base_prompt
-        if validation_feedback:
-            prompt += (
-                "\n\nREPAIR REQUIRED\n"
-                "Your previous bundle failed server validation. Regenerate the ENTIRE "
-                "bundle and fix every issue below:\n"
-                + validation_feedback
-            )
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        prompt = build_level_prompt(
+            request,
+            group,
+            difficulty,
+            avoid_texts=list(used_texts.keys()),
+            validation_feedback=validation_feedback or None,
+            minimum_average_words=minimum_average_words,
+        )
 
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_json_schema=build_bundle_json_schema(
-                        request.variants_per_level
-                    ),
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                ),
-            )
-
-            if not response.text or not response.text.strip():
-                raise ValueError("Gemini returned an empty response.")
-
-            generated = GeneratedBundle.model_validate_json(response.text)
-
+            response_text = await request_level_json(client, prompt)
+            generated = parse_generated_level(response_text)
         except Exception as exc:
             logger.exception(
-                "Gemini bundle generation error on attempt %s using model %s",
-                attempt + 1,
+                "Gemini %s-level generation error on attempt %s/%s using model %s",
+                difficulty,
+                attempt,
+                MAX_GENERATION_ATTEMPTS,
                 GEMINI_MODEL,
             )
 
             if isinstance(exc, genai_errors.APIError):
+                code, api_status, message = safe_gemini_error(exc)
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=gemini_http_detail(exc),
+                    detail={
+                        "message": "Gemini API request failed while generating a bundle level.",
+                        "failed_level": difficulty,
+                        "attempt": attempt,
+                        "gemini_code": code,
+                        "gemini_status": api_status,
+                        "gemini_message": message,
+                    },
                 ) from exc
 
-            if attempt == 0:
-                validation_feedback = (
-                    "- Return valid JSON matching the provided structured-output schema.\n"
-                    "- Do not include Markdown fences or prose outside the JSON."
-                )
+            last_errors = [
+                f"Response could not be parsed as required JSON: {type(exc).__name__}: {exc}"
+            ]
+            validation_feedback = last_errors
+            if attempt < MAX_GENERATION_ATTEMPTS:
                 continue
+            break
 
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=gemini_http_detail(exc),
-            ) from exc
+        errors, average = validate_generated_level(
+            generated,
+            request,
+            difficulty,
+            used_texts=used_texts,
+            minimum_average_words=minimum_average_words,
+        )
 
-        errors = validate_generated_bundle(generated, request)
-        if not errors:
-            return build_response(request=request, group=group, generated=generated)
+        if not errors and average is not None:
+            return generated.variants, average
 
-        validation_feedback = "\n".join(f"- {error}" for error in errors)
+        last_errors = errors or ["The generated level had no measurable reading text."]
+        validation_feedback = last_errors
         logger.warning(
-            "Generated bundle failed semantic validation on attempt %s: %s",
-            attempt + 1,
-            validation_feedback,
+            "Generated %s level failed validation on attempt %s/%s: %s",
+            difficulty,
+            attempt,
+            MAX_GENERATION_ATTEMPTS,
+            " | ".join(last_errors),
         )
 
     raise HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY,
-        detail="Gemini returned a bundle that failed validation twice.",
+        detail={
+            "message": (
+                f"Gemini could not produce a valid {difficulty} level after "
+                f"{MAX_GENERATION_ATTEMPTS} attempts."
+            ),
+            "failed_level": difficulty,
+            "attempts": MAX_GENERATION_ATTEMPTS,
+            "validation_errors": last_errors,
+        },
     )
+
+
+async def generate_bundle_with_gemini(
+    request: BundleRequest,
+    group: GroupedReadingCompetency,
+) -> ActivityBundleResponse:
+    """Generate levels independently and retry only the level that fails."""
+    client = get_gemini_client()
+    used_texts: dict[str, str] = {}
+    level_results: dict[str, list[GeneratedVariant]] = {}
+    previous_average: float | None = None
+
+    for difficulty in DIFFICULTIES:
+        variants, average = await generate_one_level(
+            client=client,
+            request=request,
+            group=group,
+            difficulty=difficulty,
+            used_texts=used_texts,
+            minimum_average_words=previous_average,
+        )
+
+        level_results[difficulty] = variants
+        used_texts.update(accepted_text_map(difficulty, variants))
+        previous_average = average
+
+    generated = GeneratedBundle(
+        bundle_title=server_bundle_title(request, group),
+        levels=GeneratedLevels(
+            easy=level_results["easy"],
+            medium=level_results["medium"],
+            hard=level_results["hard"],
+        ),
+    )
+
+    return build_response(request=request, group=group, generated=generated)
 
 
 # ============================================================
